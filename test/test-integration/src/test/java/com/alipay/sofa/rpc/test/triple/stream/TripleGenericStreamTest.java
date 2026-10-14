@@ -1,0 +1,424 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.alipay.sofa.rpc.test.triple.stream;
+
+import com.alipay.sofa.rpc.config.ApplicationConfig;
+import com.alipay.sofa.rpc.config.ConsumerConfig;
+import com.alipay.sofa.rpc.config.ProviderConfig;
+import com.alipay.sofa.rpc.config.ServerConfig;
+import com.alipay.sofa.rpc.context.RpcInternalContext;
+import com.alipay.sofa.rpc.context.RpcInvokeContext;
+import com.alipay.sofa.rpc.context.RpcRunningState;
+import com.alipay.sofa.rpc.context.RpcRuntimeContext;
+import com.alipay.sofa.rpc.log.Logger;
+import com.alipay.sofa.rpc.log.LoggerFactory;
+import com.alipay.sofa.rpc.transport.SofaStreamObserver;
+import org.junit.AfterClass;
+import org.junit.Assert;
+import org.junit.BeforeClass;
+import org.junit.Test;
+import org.mockito.Mockito;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+
+public class TripleGenericStreamTest {
+
+    private static final Logger                 LOGGER    = LoggerFactory.getLogger(TripleGenericStreamTest.class);
+    private static final String                 HELLO_MSG = "Hello, world!";
+    private static ConsumerConfig<HelloService> consumerConfig;
+    private static ProviderConfig<HelloService> providerConfig;
+    private static HelloService                 helloServiceInst;
+    private static HelloService                 helloServiceRef;
+
+    @BeforeClass
+    public static void beforeClass() throws InterruptedException {
+        RpcRunningState.setUnitTestMode(true);
+        ServerConfig serverConfig = new ServerConfig()
+            .setProtocol("tri")
+            .setPort(50066)
+            .setDaemon(false);
+
+        ApplicationConfig applicationConfig = new ApplicationConfig().setAppName("triple-server");
+        helloServiceInst = Mockito.spy(new HelloServiceImpl());
+        providerConfig = new ProviderConfig<HelloService>()
+            .setApplication(applicationConfig)
+            .setInterfaceId(HelloService.class.getName())
+            .setRef(helloServiceInst)
+            .setServer(serverConfig);
+        providerConfig.export();
+
+        // 等待服务器完全启动
+        Thread.sleep(2000);
+
+        ApplicationConfig consumerApp = new ApplicationConfig().setAppName("triple-client");
+        consumerConfig = new ConsumerConfig<HelloService>()
+            .setApplication(consumerApp)
+            .setInterfaceId(HelloService.class.getName())
+            .setProtocol("tri")
+            .setTimeout(1000000)
+            .setDirectUrl("triple://127.0.0.1:50066?appName=triple-server");
+        helloServiceRef = consumerConfig.refer();
+
+        // 等待客户端连接完全建立
+        Thread.sleep(3000);
+    }
+
+    @AfterClass
+    public static void afterClass() {
+        try {
+            if (consumerConfig != null) {
+                consumerConfig.unRefer();
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Error while unRefer consumerConfig", e);
+        }
+
+        try {
+            if (providerConfig != null) {
+                providerConfig.unExport();
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Error while unExport providerConfig", e);
+        }
+
+        try {
+            RpcRuntimeContext.destroy();
+        } catch (Exception e) {
+            LOGGER.warn("Error while destroying RpcRuntimeContext", e);
+        }
+
+        try {
+            RpcInternalContext.removeContext();
+        } catch (Exception e) {
+            LOGGER.warn("Error while removing RpcInternalContext", e);
+        }
+
+        try {
+            RpcInvokeContext.removeContext();
+        } catch (Exception e) {
+            LOGGER.warn("Error while removing RpcInvokeContext", e);
+        }
+    }
+
+    @Test
+    public void testTripleParentCall() throws InterruptedException {
+        ClientRequest clientRequest = new ClientRequest("hello world", 5);
+        ServerResponse serverResponse = helloServiceRef.sayHello(clientRequest);
+        Assert.assertEquals("hello world", serverResponse.getMsg());
+
+        CountDownLatch countDownLatch = new CountDownLatch(6);
+        AtomicBoolean receivedFinish = new AtomicBoolean(false);
+        List<ServerResponse> list = new ArrayList<>();
+        helloServiceRef.parentSayHelloServerStream(clientRequest, new SofaStreamObserver<ServerResponse>() {
+            @Override
+            public void onNext(ServerResponse message) {
+                list.add(message);
+                countDownLatch.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                receivedFinish.set(true);
+                countDownLatch.countDown();
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                LOGGER.error("Error in testTripleParentCall stream", throwable);
+                countDownLatch.countDown();
+            }
+        });
+
+        Assert.assertTrue("Stream operation timed out", countDownLatch.await(30, TimeUnit.SECONDS));
+        Assert.assertEquals("Expected 5 responses", 5, list.size());
+        Assert.assertTrue("Stream should be completed", receivedFinish.get());
+    }
+
+    @Test
+    public void testTripleBiStreamFinish() throws InterruptedException {
+        testTripleBiStream(false);
+    }
+
+    @Test
+    public void testTripleBiStreamException() throws InterruptedException {
+        testTripleBiStream(true);
+    }
+
+    public void testTripleBiStream(boolean endWithException) throws InterruptedException {
+        // Reset mock invocation history to avoid interference between test methods
+        Mockito.reset(helloServiceInst);
+
+        int requestTimes = 5;
+        CountDownLatch countDownLatch = new CountDownLatch(requestTimes + 1);
+
+        AtomicBoolean receivedFinish = new AtomicBoolean(false);
+        AtomicBoolean receivedException = new AtomicBoolean(false);
+
+        List<ServerResponse> serverResponseList = new ArrayList<>();
+        SofaStreamObserver<ClientRequest> sofaStreamObserver = helloServiceRef
+                .sayHelloBiStream(new SofaStreamObserver<ServerResponse>() {
+                    final AtomicInteger requestCount = new AtomicInteger(0);
+
+                    @Override
+                    public void onNext(ServerResponse message) {
+                        LOGGER.info("bi stream resp onMessage");
+                        Assert.assertEquals(requestCount.getAndIncrement(), message.getCount());
+                        Assert.assertEquals(HELLO_MSG, message.getMsg());
+                        serverResponseList.add(message);
+                        countDownLatch.countDown();
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        LOGGER.info("bi stream resp onFinish");
+                        receivedFinish.set(true);
+                        countDownLatch.countDown();
+                    }
+
+                    @Override
+                    public void onError(Throwable throwable) {
+                        LOGGER.error("bi stream resp onException", throwable);
+                        if (throwable.getMessage() != null) {
+                            Assert.assertTrue(throwable.getMessage().contains(HelloService.ERROR_MSG));
+                        }
+                        receivedException.set(true);
+                        countDownLatch.countDown();
+                    }
+                });
+
+        for (int k = 0; k < requestTimes; k++) {
+            if (k % 2 == 0) {
+                sofaStreamObserver.onNext(new ClientRequest(HELLO_MSG, k));
+            } else {
+                sofaStreamObserver.onNext(new ExtendClientRequest(HELLO_MSG, k, "testExtendString"));
+            }
+        }
+        if (!endWithException) {
+            sofaStreamObserver.onNext(new ClientRequest(HelloService.CMD_TRIGGER_STREAM_FINISH, -2));
+            Assert.assertTrue("Bi-stream operation timed out", countDownLatch.await(30, TimeUnit.SECONDS));
+            Assert.assertTrue("Stream should be completed", receivedFinish.get());
+            sofaStreamObserver.onCompleted();
+            assertServerResponseType(serverResponseList);
+            Assert.assertFalse("Should not receive exception", receivedException.get());
+            Assert.assertThrows(Throwable.class, () -> sofaStreamObserver.onNext(new ClientRequest("", 123)));
+        } else {
+            sofaStreamObserver.onNext(new ClientRequest(HelloService.CMD_TRIGGER_STREAM_ERROR, -2));
+            Assert.assertTrue("Bi-stream operation timed out", countDownLatch.await(30, TimeUnit.SECONDS));
+            sofaStreamObserver.onError(new RuntimeException(HelloService.ERROR_MSG));
+            Assert.assertThrows(Throwable.class, () -> sofaStreamObserver.onNext(new ClientRequest(HELLO_MSG, 0)));
+            Assert.assertFalse("Stream should not be completed", receivedFinish.get());
+            Assert.assertTrue("Should receive exception", receivedException.get());
+        }
+        verify(helloServiceInst, times(1)).sayHelloBiStream(any());
+    }
+
+    @Test
+    public void testTripleServerStreamFinish() throws InterruptedException {
+        testTripleServerStream(false);
+    }
+
+    @Test
+    public void testTripleServerStreamException() throws InterruptedException {
+        testTripleServerStream(true);
+    }
+
+    public void testTripleServerStream(boolean endWithException) throws InterruptedException {
+        reset(helloServiceInst);
+        AtomicInteger count = new AtomicInteger(0);
+        int responseTimes = 5;
+        CountDownLatch countDownLatch = new CountDownLatch(responseTimes + 1);
+        AtomicBoolean responseFinished = new AtomicBoolean(false);
+        AtomicBoolean responseException = new AtomicBoolean(false);
+
+        List<ServerResponse> serverResponseList = new ArrayList<>();
+        helloServiceRef.sayHelloServerStream(new ClientRequest(endWithException ? HelloService.CMD_TRIGGER_STREAM_ERROR : HELLO_MSG, 0), new SofaStreamObserver<ServerResponse>() {
+            @Override
+            public void onNext(ServerResponse message) {
+                Assert.assertEquals(endWithException ? HelloService.CMD_TRIGGER_STREAM_ERROR : HELLO_MSG,
+                        message.getMsg());
+                Assert.assertEquals(count.getAndIncrement(), message.getCount());
+                serverResponseList.add(message);
+                countDownLatch.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                responseFinished.set(true);
+                countDownLatch.countDown();
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                LOGGER.error("Server stream error", throwable);
+                if (throwable.getMessage() != null) {
+                    Assert.assertTrue(throwable.getMessage().contains(HelloService.ERROR_MSG));
+                }
+                responseException.set(true);
+                countDownLatch.countDown();
+            }
+        });
+
+        Assert.assertTrue("Server stream operation timed out", countDownLatch.await(30, TimeUnit.SECONDS));
+        if (endWithException) {
+            Assert.assertTrue("Should receive exception", responseException.get());
+            Assert.assertFalse("Stream should not be completed", responseFinished.get());
+            assertServerResponseType(serverResponseList);
+        } else {
+            Assert.assertTrue("Stream should be completed", responseFinished.get());
+            Assert.assertFalse("Should not receive exception", responseException.get());
+        }
+        Assert.assertEquals("Expected response count", responseTimes, count.get());
+        verify(helloServiceInst, times(1)).sayHelloServerStream(any(), any());
+    }
+
+    /**
+     * Test concurrent client sends on BiStream.
+     * Multiple threads call onNext simultaneously to verify no data is lost.
+     */
+    @Test
+    public void testConcurrentClientSendBiStream() throws InterruptedException {
+        int totalMessages = 100;
+        int threadCount = 8;
+
+        // totalMessages echo responses + 1 onCompleted
+        CountDownLatch responseLatch = new CountDownLatch(totalMessages + 1);
+        List<ServerResponse> receivedResponses = Collections.synchronizedList(new ArrayList<>());
+        AtomicBoolean receivedFinish = new AtomicBoolean(false);
+
+        SofaStreamObserver<ClientRequest> clientSender = helloServiceRef
+                .sayHelloBiStream(new SofaStreamObserver<ServerResponse>() {
+                    @Override
+                    public void onNext(ServerResponse message) {
+                        receivedResponses.add(message);
+                        responseLatch.countDown();
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        receivedFinish.set(true);
+                        responseLatch.countDown();
+                    }
+
+                    @Override
+                    public void onError(Throwable throwable) {
+                        LOGGER.error("Concurrent bi-stream error", throwable);
+                        responseLatch.countDown();
+                    }
+                });
+
+        // Use multiple threads to send concurrently
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch sendDoneLatch = new CountDownLatch(totalMessages);
+
+        for (int i = 0; i < totalMessages; i++) {
+            final int index = i;
+            executor.submit(() -> {
+                try {
+                    startLatch.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                try {
+                    clientSender.onNext(new ClientRequest(HELLO_MSG, index));
+                } finally {
+                    sendDoneLatch.countDown();
+                }
+            });
+        }
+
+        // Release all threads at once to maximize concurrency
+        startLatch.countDown();
+        executor.shutdown();
+        Assert.assertTrue("Client send timed out", sendDoneLatch.await(30, TimeUnit.SECONDS));
+
+        // Signal server to finish
+        clientSender.onNext(new ClientRequest(HelloService.CMD_TRIGGER_STREAM_FINISH, -1));
+
+        Assert.assertTrue("Response timed out", responseLatch.await(30, TimeUnit.SECONDS));
+
+        LOGGER.info("Client sent {} messages, client got back {} echo responses",
+                totalMessages, receivedResponses.size());
+
+        Assert.assertTrue("Stream should be completed", receivedFinish.get());
+        Assert.assertEquals("Client should receive all echo responses (no data loss)", totalMessages, receivedResponses.size());
+    }
+
+    /**
+     * Test concurrent server sends on ServerStream.
+     * Server uses multiple threads to call onNext simultaneously to verify no data is lost.
+     */
+    @Test
+    public void testConcurrentServerSendServerStream() throws InterruptedException {
+        int totalMessages = 100;
+        CountDownLatch responseLatch = new CountDownLatch(totalMessages + 1);
+        List<ServerResponse> receivedResponses = Collections.synchronizedList(new ArrayList<>());
+        AtomicBoolean receivedFinish = new AtomicBoolean(false);
+
+        helloServiceRef.sayHelloServerStream(
+                new ClientRequest(HelloService.CMD_TRIGGER_CONCURRENT_SERVER_SEND, totalMessages),
+                new SofaStreamObserver<ServerResponse>() {
+                    @Override
+                    public void onNext(ServerResponse message) {
+                        receivedResponses.add(message);
+                        responseLatch.countDown();
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        receivedFinish.set(true);
+                        responseLatch.countDown();
+                    }
+
+                    @Override
+                    public void onError(Throwable throwable) {
+                        LOGGER.error("Concurrent server-stream error", throwable);
+                        responseLatch.countDown();
+                    }
+                });
+
+        Assert.assertTrue("Server stream timed out", responseLatch.await(30, TimeUnit.SECONDS));
+
+        LOGGER.info("Server sent {} messages concurrently, client received {} responses",
+                totalMessages, receivedResponses.size());
+
+        Assert.assertTrue("Stream should be completed", receivedFinish.get());
+        Assert.assertEquals("Client should receive all messages", totalMessages, receivedResponses.size());
+    }
+
+    private void assertServerResponseType(List<ServerResponse> serverResponseList) {
+        for (int i = 0; i < serverResponseList.size(); i++) {
+            if (i % 2 != 0) {
+                Assert.assertTrue(serverResponseList.get(i) instanceof ExtendServerResponse);
+            }
+        }
+    }
+
+}
